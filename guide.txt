@@ -1,0 +1,496 @@
+;; Hi, in this video, I want to show you, how to switch a Linux virtual machine from EXT4 file system 
+;; to Root on the ZFS file system without any out of band help. This particular machine will use Debian 12 Bookworm.
+;; https://openzfs.github.io/openzfs-docs/Getting%20Started/Debian/Debian%20Bullseye%20Root%20on%20ZFS.html
+
+;; In ~/.ssh/config
+;; Include temporary_config
+# echo "Include temporary_config" >> ~/.ssh/config
+
+# cat <<EOF > ~/.ssh/temporary_config
+Host example-ext-to-zfs
+        HostName 78.47.167.210 # Not in DNS or /etc/hosts yet (can be IPv4 and IPv6 then)
+        User root
+        Port 22 # Not reconfigured yet
+        IdentityFile /home/adamkalisz/.ssh/personal_ed25519
+        IdentitiesOnly yes
+EOF
+
+;; Log in and check configuration
+
+ssh example-ext-to-zfs
+# ip a
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1/128 scope host 
+       valid_lft forever preferred_lft forever
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000
+    link/ether 96:00:02:4d:25:27 brd ff:ff:ff:ff:ff:ff
+    altname enp0s3
+    altname ens3
+    inet 128.140.32.42/32 brd 128.140.32.42 scope global dynamic eth0
+       valid_lft 80947sec preferred_lft 80947sec
+    inet6 2a01:4f8:1c1b:45d8::1/64 scope global 
+       valid_lft forever preferred_lft forever
+    inet6 fe80::9400:2ff:fe4d:2527/64 scope link 
+       valid_lft forever preferred_lft forever
+
+# exit
+
+# sfdisk -l
+Disk /dev/sda: 38.15 GiB, 40961572864 bytes, 80003072 sectors
+Disk model: QEMU HARDDISK   
+Units: sectors of 1 * 512 = 512 bytes
+Sector size (logical/physical): 512 bytes / 512 bytes
+I/O size (minimum/optimal): 512 bytes / 512 bytes
+Disklabel type: gpt
+Disk identifier: 73F71C96-9D37-4A17-8BC7-3E325EA7B8A4
+
+Device      Start      End  Sectors  Size Type
+/dev/sda1  503808 80003038 79499231 37.9G Linux filesystem
+/dev/sda14   2048     4095     2048    1M BIOS boot
+/dev/sda15   4096   503807   499712  244M EFI System
+
+Partition table entries are not in disk order.
+
+;; 128K recordsize is 128*1024=131072 Bytes
+;; Hetzner Debian 12 machines seem to be aligned by default
+;; >>> 503808*512
+;; 257949696
+;; >>> 128*1024
+;; 131072
+;; >>> 257949696/4096
+;; 62976.0
+;; >>> 257949696/131072
+;; 1968.0
+
+;; Remove for now the cloud-initramfs-growroot package to prevent resizing after boot.
+;; This keeps increasing the partition after we resize it!!!
+# apt remove cloud-initramfs-growroot
+
+# sfdisk -d /dev/sda > /sda.dump
+# cat /sda.dump
+label: gpt
+label-id: 73F71C96-9D37-4A17-8BC7-3E325EA7B8A4
+device: /dev/sda
+unit: sectors
+first-lba: 34
+last-lba: 80003038
+sector-size: 512
+
+/dev/sda1 : start=      503808, size=    79499231, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, uuid=31597F60-F5A2-4F6D-A3D4-8BDEDC216B20
+/dev/sda14 : start=        2048, size=        2048, type=21686148-6449-6E6F-744E-656564454649, uuid=3F9FF4F9-B2A4-4D3C-ACE2-4163A280082F
+/dev/sda15 : start=        4096, size=      499712, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, uuid=45B4FA81-9DD6-40BF-A229-40B23495966A
+
+;; Change the line /dev/sda1 from size= 79499231 to size= 8388800
+;; This is 4GB in 512 B sectors with a small reserve
+;; (4*1024**3)/4096 -> 1048576.0 round up slightly (just add multiple of 8) -> 1048600 -> multiply by 8 -> 8388800
+
+;; It is important to only change the line with sda1, therefore the extra space between it and the colon.
+# sed -i -e '/\/dev\/sda1 :/ s/size=[ 0-9]\+,/size= 8388800,/' /sda.dump
+
+;; This script includes all the needed tools in initrd/ initramfs. Note the need to escape $ signs in the here-doc.
+###
+cat <<EOF > /etc/initramfs-tools/hooks/resizefs 
+#!/bin/sh
+
+set -e
+
+PREREQS=""
+
+prereqs() { echo "\$PREREQS"; }
+
+case "\$1" in
+    prereqs)
+        prereqs
+        exit 0
+    ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+cp /sda.dump \${DESTDIR}/sda.dump
+chmod 644 \${DESTDIR}/sda.dump
+
+copy_exec /sbin/e2fsck
+copy_exec /sbin/resize2fs
+copy_exec /sbin/sfdisk
+    
+exit 0
+EOF
+chmod +x /etc/initramfs-tools/hooks/resizefs
+###
+
+;; This script shrinks the EXT4 filesystem and moves the partition almost to the end of the disk.
+;; Total size of partition (fdisk -l output): 80003072, last-lba is usually lower 80003038 since it aligns to 1MiB offset
+;; (2048 sectors), in some cases 34 sectors less than the total size.
+;; Move partition (look at total sectors last-lba/ "End in fdisk -l output" 80003038-8388800 -> 71614238 (if you wish round down a bit e.g. by a multiple of 2048 is not a bad idea)
+###
+cat > /etc/initramfs-tools/scripts/local-premount/resizefs <<EOF
+#!/bin/sh
+
+set -e
+
+PREREQS=""
+
+prereqs() { echo "\$PREREQS"; }
+
+case "\$1" in
+    prereqs)
+        prereqs
+        exit 0
+    ;;
+esac
+
+# simple device example
+/sbin/e2fsck -yf /dev/sda1
+/sbin/resize2fs /dev/sda1 4G # see size info below
+/sbin/e2fsck -yf /dev/sda1
+/sbin/sfdisk --force /dev/sda < /sda.dump
+echo "71614238," | /sbin/sfdisk --force --move-data /dev/sda -N 1
+
+# complex device example
+# activate md-raid containing FS/PV
+#/sbin/mdadm -A /dev/md0
+# activate VG containing FS
+#/sbin/lvm vgchange -ay vg0
+# resize
+#/sbin/e2fsck -yf /dev/vg0/root # or /dev/md0
+#/sbin/resize2fs /dev/vg0/root 5G
+#/sbin/e2fsck -yf /dev/vg0/root
+EOF
+chmod +x /etc/initramfs-tools/scripts/local-premount/resizefs
+###
+
+;; Prevent cloud init from growing a partition/ file system automatically
+;; E.g. the lines:
+;; # - [ growpart, always ]
+;; # - [ resizefs, always ]
+# sed -i -e '/growpart\|resizefs\|disk_setup/ s/^#*/#/' /etc/cloud/cloud.cfg
+# sed -i -e '/growpart\|resizefs\|disk_setup/ s/^#*/#/' /etc/cloud/cloud.cfg.d/90-hetznercloud.cfg
+
+;; Make sure it is all correct
+# cat /etc/cloud/cloud.cfg
+# cat /etc/cloud/cloud.cfg.d/90-hetznercloud.cfg
+
+;; Update all kernels (we could update just one, but if we bork this install, we don't want to continue anyway)
+;; Remove old kernels that are no longer needed, this shouldn't be a blocker, but it leaves more space for the shrinking.
+;; And perhaps removes a menu entry in the boot menu.
+# update-initramfs -u -k all
+
+;; You can check the needed binaries e2fsck, resize2fs and sfdisk are present in the kernel
+# lsinitramfs /boot/initrd.img-6.1.0-9-amd64 | grep -E "sfdisk|e2fsck|resize2fs"
+
+;; Update GRUB bootloader
+# update-grub
+
+# reboot
+
+;; Check the resize and move was successful
+;; (now we should see a 4G partition for /dev/sda1)
+# fdisk -l
+
+;; If successfully resized, undo changes
+# rm /etc/initramfs-tools/scripts/local-premount/resizefs
+# rm /etc/initramfs-tools/hooks/resizefs
+# update-initramfs -u -k all
+;; Leave the commented growpart and resizefs modules in cloud init config, we don't want to change the partition in any way.
+
+;; Now the partition is at the end of the disk, initramfs is generated to not do any partition changes on boot, the partitioning in cloudinit is disabled for now.
+
+;; Install needed packages
+;; zfs-initramfs zfs-zed debootstrap gdisk ; debootstrap and gdisk are probably not needed, (gdisk seems to be installed anyway)
+;; if the rsync approach is taken, on the other hand, we can install zfs-initramfs zfs-zed now
+# apt update && apt install --yes zfsutils-linux zfs-dkms linux-headers-amd64
+
+;; Find the disk identifier for installation e.g.:
+# ls -l /dev/disk/by-id/
+# DISK=/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_33543806
+;; If this is missing, follow the simple workaround: https://openzfs.github.io/openzfs-docs/Getting%20Started/Debian/Debian%20Bullseye%20Root%20on%20ZFS.html#troubleshooting with OVMF)
+
+;; If /sys/firmware/efi exists, the system booted using UEFI (according to https://wiki.debian.org/UEFI#How_to_tell_if_you.27ve_booted_via_UEFI)
+;; Hetzner seems to be using BIOS for now: https://www.reddit.com/r/hetzner/comments/hpsop8/hetzner_cloud_server_os_boot_uefi_or_bios/
+;; https://docs.hetzner.com/cloud/technical-details/faq
+
+;; Do not wipe the partition table (keep BIOS partition, EFI partition and the current root partition at the end)
+
+;; Boot pool:
+;; We use double the space here to have more space for snapshots etc.
+# sgdisk     -n3:0:+2G      -t3:BF01 $DISK  
+;; Root pool:
+# sgdisk     -n4:0:0        -t4:BF00 $DISK
+
+;; Force re-read of the partition table
+;; or $DISK rather than /dev/sda
+# partx --update /dev/sda
+# fdisk -l
+;; Check alignment for start of the /dev/sda4 (${DISK}-part4) partition, it should be divisible by 4096 without rest, ideally divisible by 131072 (128K, the default recordsize for ZFS) too but
+;; that is not strictly needed/ should not have material effect on performance.
+
+;; The part3 might include the ext4 signature, because the beginning of the drive was previously in the current root partition.
+;; Only shows the signatures
+# wipefs ${DISK}-part3
+;; Wipe those signatures
+# wipefs --all --force ${DISK}-part3
+;; Or you can write a few blocks to the disk using
+;; dd if=/dev/zero of=${DISK}-part3 bs=1M count=1 status=progress
+;; You can also use the backup option, in case you were mistaken
+;; https://www.cyberciti.biz/faq/howto-use-wipefs-to-wipe-a-signature-from-disk-on-linux/
+
+;; Load the ZFS kernel module
+# modprobe zfs
+
+;; Initialize the boot pool:
+# zpool create \
+    -o ashift=12 \
+    -o autotrim=on -d \
+    -o cachefile=/etc/zfs/zpool.cache \
+    -o feature@async_destroy=enabled \
+    -o feature@bookmarks=enabled \
+    -o feature@embedded_data=enabled \
+    -o feature@empty_bpobj=enabled \
+    -o feature@enabled_txg=enabled \
+    -o feature@extensible_dataset=enabled \
+    -o feature@filesystem_limits=enabled \
+    -o feature@hole_birth=enabled \
+    -o feature@large_blocks=enabled \
+    -o feature@livelist=enabled \
+    -o feature@lz4_compress=enabled \
+    -o feature@spacemap_histogram=enabled \
+    -o feature@zpool_checkpoint=enabled \
+    -O devices=off \
+    -O acltype=posixacl -O xattr=sa \
+    -O compression=lz4 \
+    -O normalization=formD \
+    -O relatime=on \
+    -O canmount=off -O mountpoint=/boot -R /mnt \
+    bpool ${DISK}-part3
+
+;; Root pool, the LZ4 compression is ok, but you could use zstd-1 for compression too as it should give better results for the default block size of 128k.
+# zpool create \
+    -o ashift=12 \
+    -o autotrim=on \
+    -O acltype=posixacl -O xattr=sa -O dnodesize=auto \
+    -O compression=lz4 \
+    -O normalization=formD \
+    -O relatime=on \
+    -O canmount=off -O mountpoint=/ -R /mnt \
+    rpool ${DISK}-part4
+
+;; Create filesystem datasets to act as containers
+# zfs create -o canmount=off -o mountpoint=none rpool/ROOT
+# zfs create -o canmount=off -o mountpoint=none bpool/BOOT
+
+;; Create filesystem datasets for the root and boot filesystems
+# zfs create -o canmount=noauto -o mountpoint=/ rpool/ROOT/debian
+# zfs mount rpool/ROOT/debian
+
+# zfs create -o mountpoint=/boot bpool/BOOT/debian
+
+;; Create more datasets
+###
+zfs create                     rpool/home
+zfs create -o mountpoint=/root rpool/home/root
+chmod 700 /mnt/root
+zfs create -o canmount=off     rpool/var
+zfs create -o canmount=off     rpool/var/lib
+zfs create                     rpool/var/log
+zfs create                     rpool/var/spool
+
+zfs create -o com.sun:auto-snapshot=false rpool/var/cache
+zfs create -o com.sun:auto-snapshot=false rpool/var/lib/nfs
+zfs create -o com.sun:auto-snapshot=false rpool/var/tmp
+chmod 1777 /mnt/var/tmp
+
+zfs create -o canmount=off rpool/usr
+zfs create                 rpool/usr/local
+
+zfs create rpool/var/mail
+zfs create rpool/var/www
+
+zfs create rpool/opt
+###
+
+;; Create the dataset for PostgreSQL, we assume compressible data and choose 16K records (instead of 8K matching PostgreSQL internal block size, to improve compression without huge write amplification)
+# zfs create -o atime=off -o compression=zstd-1 -o recordsize=16K rpool/var/lib/postgresql
+
+;; Mount the filesystems you need
+###
+mkdir -p /mnt/run
+mount -t tmpfs tmpfs /mnt/run
+mkdir -p /mnt/run/lock
+###
+
+;; Either run the debootstrap + chroot installation with all the setup, or just copy the running system over
+;; look at https://wiki.archlinux.org/title/Rsync#File_system_cloning and https://wiki.archlinux.org/title/Rsync#Full_system_backup
+;; for usage tips.
+# rsync -qaAHSX --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/mnt/*","/media/*","/srv","/lost+found"} / /mnt
+
+;; Mount stuff (also add /run), chroot in:
+###
+mount --make-private --rbind /dev  /mnt/dev
+mount --make-private --rbind /proc /mnt/proc
+mount --make-private --rbind /sys  /mnt/sys
+mount --make-private --rbind /run  /mnt/run
+chroot /mnt /usr/bin/env DISK=$DISK bash --login
+###
+
+;; Enable importing bpool, clean up fstab
+;; Grub probe/ update-initramfs
+;; Now in the chroot:
+# apt install --yes zfs-initramfs zfs-zed
+# echo REMAKE_INITRD=yes > /etc/dkms/zfs.conf
+
+;; Ignore cryptsetup warnings, cryptsetup does not support ZFS
+
+;; Remove or comment the line containing ext4 from /etc/fstab
+;; Comment out (useful for easier repair)
+# sed  -i -e '/ext4/ s/^#*/#/' /etc/fstab
+;; or remove
+;; # sed -i '/ext4/d' /etc/fstab
+
+;; Grub should already be present, so we just need to update it, which we will do at the end.
+
+;; Enable importing the boot pool (bpool)
+###
+cat <<EOF > /etc/systemd/system/zfs-import-bpool.service
+[Unit]
+DefaultDependencies=no
+Before=zfs-import-scan.service
+Before=zfs-import-cache.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/zpool import -N -o cachefile=none bpool
+# Work-around to preserve zpool cache:
+ExecStartPre=-/bin/mv /etc/zfs/zpool.cache /etc/zfs/preboot_zpool.cache
+ExecStartPost=-/bin/mv /etc/zfs/preboot_zpool.cache /etc/zfs/zpool.cache
+
+[Install]
+WantedBy=zfs-import.target
+EOF
+###
+# cat /etc/systemd/system/zfs-import-bpool.service
+# systemctl enable zfs-import-bpool.service
+
+;; For some native NVMe disks this might fail, add -d DISK-part3 to the zpool import command (replace DISK with the path)
+
+;; Enable tmpfs, mutually exclusive with a /tmp dataset
+cp /usr/share/systemd/tmp.mount /etc/systemd/system/
+systemctl enable tmp.mount
+
+;; Final adjustments
+;; Test grub (should output "zfs")
+# grub-probe /boot 
+;; Rebuild initrd/ initramfs files
+# update-initramfs -c -k all
+;; This is ok:
+;; cryptsetup: ERROR: Couldn't resolve device rpool/ROOT/debian
+;; cryptsetup: WARNING: Couldn't determine root device
+
+;; Adjust the GRUB settings
+;; Recommended, already present on Hetzner VMs
+;; Remove quiet from: GRUB_CMDLINE_LINUX_DEFAULT
+;; Uncomment: GRUB_TERMINAL=console
+;; Save and quit as needed or run this script.
+# sed -i 's%^GRUB_CMDLINE_LINUX=""%GRUB_CMDLINE_LINUX="root=ZFS=rpool/ROOT/debian"%' /etc/default/grub
+
+;; Optionally lower GRUB_TIMEOUT from 5 to 2 seconds to speed up boot a bit.
+# sed -i '/GRUB_TIMEOUT=/ s/GRUB_TIMEOUT=5/GRUB_TIMEOUT=2/' /etc/default/grub
+# cat /etc/default/grub
+
+;; Update grub
+# update-grub
+
+;; Grub installation should not be needed, but it does not hurt to do anyway.
+;; DISK=/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_33543806 should still be valid
+;; You should not need to define $DISK again
+# echo $DISK
+# grub-install $DISK
+;; Installation finished. No error reported.
+
+;; Fix filesystem mount ordering
+###
+mkdir -p /etc/zfs/zfs-list.cache
+touch /etc/zfs/zfs-list.cache/bpool
+touch /etc/zfs/zfs-list.cache/rpool
+zed -F &
+###
+;; Press another enter, verify the caches are not empty
+# cat /etc/zfs/zfs-list.cache/bpool
+# cat /etc/zfs/zfs-list.cache/rpool
+
+;; If not, refer to the guide.
+;; Stop zed
+# fg
+;; Press Ctrl-C to exit zed.
+
+;; Fix paths
+# sed -Ei "s|/mnt/?|/|" /etc/zfs/zfs-list.cache/*
+
+;; Make a snapshot
+# zfs snapshot bpool/BOOT/debian@install
+# zfs snapshot rpool/ROOT/debian@install
+
+;; Exit the chroot
+;; We are not cleaning up.
+# exit
+
+;; Unmount the filesystems
+###
+mount | grep -v zfs | tac | awk '/\/mnt/ {print $3}' | \
+    xargs -i{} umount -lf {}
+zpool export -a
+###
+
+;; If this fails for rpool, mounting it on boot will fail and you will need to zpool import -f rpool, then exit in the initamfs prompt.
+;; zpool export might show that rpool is busy. Rebooting shouldn't be too troublesome.
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Now we should be able to reboot into our new system.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+# reboot
+
+;; Check after reboot
+# uptime && uname -a
+# zpool list
+# zfs list
+
+;; Check the partition layout
+# fdisk -l
+
+;; Check which ID points to ../../sda1
+# ls -l /dev/disk/by-id/
+# DISK=/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_33543806
+;; Backup the partition table just in case
+# sfdisk -d $DISK > /sda_before_cleanup.dump
+;; To restore
+;; sfdisk --force $DISK < /sda_before_cleanup.dump
+# sfdisk --delete $DISK 1
+
+;; Rescan partitions
+# partx --update $DISK
+# fdisk -l
+
+;; Not needed currently but might be needed for simpler expansion of the underlying partition
+;; Not clear if this works:
+;; # sed -i -e '/growpart/ s/^#//' /etc/cloud/cloud.cfg
+;; # sed -i -e '/growpart/ s/^#//' /etc/cloud/cloud.cfg.d/90-hetznercloud.cfg
+;; # apt install cloud-initramfs-growroot
+
+;; This manual approach should always work but for obvious reasons, be careful.
+# ls -l /dev/disk/by-id/
+# DISK=/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_33543806
+;; Delete and recreate the partition of the root pool
+# sgdisk -d 4 $DISK
+# sgdisk     -n4:0:0        -t4:BF00 $DISK
+# partx --update $DISK
+;; partx: /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_33543806: error updating partition 4
+;; In such case, reboot and try again.
+
+;; The auto expansion is probably off, do it manually:
+# zpool get all | grep autoex
+
+# zpool online -e rpool $DISK-part4
